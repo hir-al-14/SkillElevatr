@@ -10,3 +10,4 @@ nomic
 jobspy
 langchain
 requests
+python-dotenv
