@@ -1,24 +1,40 @@
 import os
-import sys
-import pdfplumber
-import requests
+import io
 import csv
 import re
 import json
+import pdfplumber
+import requests
+import logging
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 
+# === Configuration ===
 OLLAMA_URL = "http://localhost:11434/api/embeddings"
 MODEL = "nomic-embed-text"
 OUTPUT_CSV = "data/resumes.csv"
 
+# === Logging Setup ===
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# === FastAPI App ===
+app = FastAPI()
+
+# === Embedding ===
 def get_embedding_ollama(text):
     try:
         response = requests.post(OLLAMA_URL, json={"model": MODEL, "prompt": text})
         response.raise_for_status()
         return response.json()["embedding"]
     except Exception as e:
-        print(f"[ERROR] Embedding failed: {e}")
+        logger.error(f"Embedding failed: {e}")
         return []
 
+# === Section Extraction ===
 def extract_sections(text):
     section_patterns = {
         "education": r"(education|academic background|educational qualifications)",
@@ -28,11 +44,9 @@ def extract_sections(text):
         "other": r"(certifications|awards|honors|activities|interests|languages|volunteering)"
     }
 
-    # Normalize and clean text
     text_lines = [line.strip().lower() for line in text.splitlines() if line.strip()]
     text = '\n'.join(text_lines)
 
-    # Find section starts
     section_indices = {}
     for key, pattern in section_patterns.items():
         match = re.search(rf"\b{pattern}\b", text, re.IGNORECASE)
@@ -40,20 +54,17 @@ def extract_sections(text):
             section_indices[key] = match.start()
 
     sorted_sections = sorted(section_indices.items(), key=lambda x: x[1])
-
-    # Slice sections from full text
     sections = {}
     for i, (section, start_idx) in enumerate(sorted_sections):
-        end_idx = sorted_sections[i+1][1] if i + 1 < len(sorted_sections) else len(text)
-        content = text[start_idx:end_idx].strip()
-        sections[section] = content
+        end_idx = sorted_sections[i + 1][1] if i + 1 < len(sorted_sections) else len(text)
+        sections[section] = text[start_idx:end_idx].strip()
 
     for key in section_patterns:
         if key not in sections:
             sections[key] = ""
 
-    # Assume first line is name if short
     name = text_lines[0].title() if text_lines and len(text_lines[0]) < 100 else "Unknown"
+    logger.debug(f"Extracted sections: {list(sections.keys())}")
 
     return {
         "name": name,
@@ -64,47 +75,10 @@ def extract_sections(text):
         "other": sections["other"]
     }
 
-def process_resume(pdf_path):
-    with pdfplumber.open(pdf_path) as pdf:
-        text = "\n".join(p.extract_text() for p in pdf.pages if p.extract_text())
-
-    sections = extract_sections(text)
-    embeddings = {
-        k: get_embedding_ollama(v) for k, v in sections.items() if k != "name"
-    }
-
-    return [
-        os.path.basename(pdf_path),
-        sections["name"],
-        sections["education"],
-        sections["experience"],
-        sections["projects"],
-        sections["skills"],
-        sections["other"],
-        json.dumps(embeddings["education"]),
-        json.dumps(embeddings["experience"]),
-        json.dumps(embeddings["projects"]),
-        json.dumps(embeddings["skills"]),
-        json.dumps(embeddings["other"]),
-    ]
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python resume_scraper.py <resume.pdf>")
-        sys.exit(1)
-
-    resume_path = sys.argv[1]
-    if not os.path.isfile(resume_path) or not resume_path.endswith(".pdf"):
-        print("Error: Provide a valid PDF file.")
-        sys.exit(1)
-
+# === Save to CSV ===
+def save_to_csv(data_row):
     os.makedirs("data", exist_ok=True)
-
-    print(f"[INFO] Processing {resume_path}")
-    row = process_resume(resume_path)
-
     write_header = not os.path.exists(OUTPUT_CSV)
-
     with open(OUTPUT_CSV, "a", newline='', encoding="utf-8") as f:
         writer = csv.writer(f)
         if write_header:
@@ -112,7 +86,50 @@ def main():
                 "file", "name", "education", "experience", "projects", "skills", "other",
                 "emb_education", "emb_experience", "emb_projects", "emb_skills", "emb_other"
             ])
-        writer.writerow(row)
+        writer.writerow(data_row)
+    logger.info(f"Resume written to {OUTPUT_CSV}")
 
-if __name__ == "__main__":
-    main()
+# === Upload Resume Endpoint ===
+@app.post("/upload_resume")
+async def upload_resume(file: UploadFile = File(...)):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+    try:
+        content = await file.read()
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            text = "\n".join(p.extract_text() for p in pdf.pages if p.extract_text())
+
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+
+        sections = extract_sections(text)
+        embeddings = {k: get_embedding_ollama(v) for k, v in sections.items() if k != "name"}
+
+        row = [
+            file.filename,
+            sections["name"],
+            sections["education"],
+            sections["experience"],
+            sections["projects"],
+            sections["skills"],
+            sections["other"],
+            json.dumps(embeddings["education"]),
+            json.dumps(embeddings["experience"]),
+            json.dumps(embeddings["projects"]),
+            json.dumps(embeddings["skills"]),
+            json.dumps(embeddings["other"]),
+        ]
+
+        save_to_csv(row)
+
+        logger.info(f"Resume processed successfully: {file.filename}")
+        return JSONResponse({
+            "message": "Resume uploaded and embedded successfully",
+            "name": sections["name"],
+            "sections": list(sections.keys())
+        })
+
+    except Exception as e:
+        logger.exception("Failed to process resume")
+        raise HTTPException(status_code=500, detail="Something went wrong while processing the resume.")

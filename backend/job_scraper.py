@@ -1,42 +1,64 @@
-import sys
-import time
+import os
 import uuid
+import json
+import logging
 import requests
 import pandas as pd
-from jobspy import scrape_jobs
-from pymongo import MongoClient
 from dotenv import load_dotenv
-import os
-import json
+from pymongo import MongoClient
+from jobspy import scrape_jobs
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-# Load MongoDB connection
+# === Configuration ===
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
 OLLAMA_URL = "http://localhost:11434/api/embeddings"
 MODEL = "nomic-embed-text"
 
+# === Logging Setup ===
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# === MongoDB Connection ===
 client = MongoClient(MONGO_URI)
 db = client["skillelevatr"]
 collection = db["jobs"]
 
+# === FastAPI App ===
+app = FastAPI()
+
+# === Helper Functions ===
 def get_embedding(text: str) -> list:
     try:
         response = requests.post(OLLAMA_URL, json={"model": MODEL, "prompt": text})
         response.raise_for_status()
         return response.json()["embedding"]
     except Exception as e:
-        print(f"[ERROR] Failed to embed description: {e}")
+        logger.error(f"Failed to embed description: {e}")
         return []
 
 def generate_fallback_id(job_doc: dict) -> str:
     base = f"{job_doc.get('title', '')}-{job_doc.get('company', '')}-{job_doc.get('location', '')}"
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, base))
 
-def scrape_and_store_jobs(role: str, location: str, job_type: str = None, limit: int = 100):
-    print(f"\n[INFO] Scraping: '{role}' in '{location}' | Job Type: {job_type or 'Any'}")
+def check_existing_jobs(role: str, location: str, job_type: str, limit: int) -> bool:
+    query = {
+        "role": role,
+        "location_searched": location,
+        "job_type_filter": job_type,
+        "embedding": {"$exists": True}
+    }
+    existing_count = collection.count_documents(query)
+    logger.info(f"Found {existing_count} existing jobs for '{role}' in '{location}' with type '{job_type}'.")
+    return existing_count >= limit
 
-    collection.delete_many({})
-    print("[INFO] Cleared old job data from MongoDB.")
+def scrape_and_store_jobs(role: str, location: str, job_type: str = None, limit: int = 100):
+    if check_existing_jobs(role, location, job_type, limit):
+        logger.info(f"[SKIP] Already have {limit} or more jobs. Skipping scrape.")
+        return
+
+    logger.info(f"Scraping: '{role}' in '{location}' | Job Type: {job_type or 'Any'}")
 
     filters = {}
     if job_type and job_type.lower() != "all":
@@ -57,12 +79,12 @@ def scrape_and_store_jobs(role: str, location: str, job_type: str = None, limit:
         df.dropna(subset=["description"], inplace=True)
 
         if df.empty:
-            print(f"[WARN] No jobs with description found.")
+            logger.warning("No jobs with description found.")
             return
 
-        print(f"[INFO] {len(df)} jobs found.")
+        logger.info(f"{len(df)} jobs found.")
     except Exception as e:
-        print(f"[ERROR] Scraping failed: {e}")
+        logger.error(f"Scraping failed: {e}")
         return
 
     for _, row in df.iterrows():
@@ -84,25 +106,23 @@ def scrape_and_store_jobs(role: str, location: str, job_type: str = None, limit:
             "embedding": get_embedding(row.get("description"))
         }
 
-        collection.update_one(
-            {"id": job_doc["id"]},
-            {"$set": job_doc},
-            upsert=True
-        )
+        collection.update_one({"id": job_doc["id"]}, {"$set": job_doc}, upsert=True)
 
-    print(f"[SUCCESS] Stored {len(df)} jobs for role: '{role}' in '{location}'")
+    logger.info(f"[SUCCESS] Stored {len(df)} jobs for role: '{role}' in '{location}'")
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: python job_scraper.py <job_role> <location> [job_type]")
-        print("Example: python job_scraper.py 'data scientist' 'India' fulltime")
-        sys.exit(1)
+# === Pydantic Model ===
+class JobScrapeRequest(BaseModel):
+    role: str
+    location: str
+    job_type: str = ""
+    limit: int = 100
 
-    role = sys.argv[1]
-    location = sys.argv[2]
-    job_type = sys.argv[3] if len(sys.argv) > 3 else None
-
-    scrape_and_store_jobs(role, location, job_type)
-
-if __name__ == "__main__":
-    main()
+# === FastAPI Endpoint ===
+@app.post("/scrape_jobs")
+def trigger_scrape(request: JobScrapeRequest):
+    try:
+        scrape_and_store_jobs(request.role, request.location, request.job_type, request.limit)
+        return {"message": "Scraping complete or skipped if already present."}
+    except Exception as e:
+        logger.exception("Job scraping failed.")
+        raise HTTPException(status_code=500, detail="Failed to scrape jobs.")

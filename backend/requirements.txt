@@ -11,3 +11,5 @@ jobspy
 langchain
 requests
 python-dotenv
+numpy
+python-multipart
