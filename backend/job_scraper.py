@@ -32,7 +32,7 @@ def generate_fallback_id(job_doc: dict) -> str:
     base = f"{job_doc.get('title', '')}-{job_doc.get('company', '')}-{job_doc.get('location', '')}"
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, base))
 
-def scrape_and_store_jobs(role: str, location: str, job_type: str = None, limit: int = 30):
+def scrape_and_store_jobs(role: str, location: str, job_type: str = None, limit: int = 100):
     print(f"\n[INFO] Scraping: '{role}' in '{location}' | Job Type: {job_type or 'Any'}")
 
     collection.delete_many({})
