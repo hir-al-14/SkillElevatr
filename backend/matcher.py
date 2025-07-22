@@ -1,153 +1,168 @@
 import os
-import sys
 import json
 import requests
+from decimal import Decimal
+from typing import List, Optional
+
 import numpy as np
 import pandas as pd
-from pymongo import MongoClient
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
+from pymongo import MongoClient
 
 app = FastAPI()
 
-# Load environment variables
+# === Environment Setup ===
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
-OLLAMA_URL = "http://localhost:11434/api/embeddings"
+OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
 OLLAMA_GENAI_URL = "http://localhost:11434/api/generate"
-MODEL = "nomic-embed-text"
+EMBED_MODEL = "nomic-embed-text"
 GENAI_MODEL = "llama3"
 
-# MongoDB connection
 client = MongoClient(MONGO_URI)
-db = client["skillelevatr"]
-collection = db["jobs"]
+collection = client["skillelevatr"]["jobs"]
 
-# Cosine similarity function
-def cosine_similarity(a, b):
-    a, b = np.array(a), np.array(b)
-    if not a.any() or not b.any() or np.isnan(a).any() or np.isnan(b).any():
-        return 0.7
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+class MatchRequest(BaseModel):
+    job_title: str
+    location: str
 
-# Resume loading from CSV
-def load_resume_embeddings(csv_file="data/resumes.csv"):
-    if not os.path.exists(csv_file):
-        print("[ERROR] resumes.csv not found.")
+# === Vector Functions ===
+def sanitize_vector(vec):
+    try:
+        arr = np.array(vec, dtype=np.float32)
+        if not arr.size or np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
+            return None
+        return arr
+    except Exception:
+        return None
+
+def cosine_similarity(vec1, vec2) -> Optional[float]:
+    v1 = sanitize_vector(vec1)
+    v2 = sanitize_vector(vec2)
+    if v1 is None or v2 is None:
+        return None
+    try:
+        sim = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+        return round(sim, 6) if np.isfinite(sim) and sim > 0 else None
+    except Exception:
+        return None
+
+# === Embedding & GenAI ===
+def get_embedding(text: str) -> Optional[List[float]]:
+    try:
+        res = requests.post(OLLAMA_EMBED_URL, json={"model": EMBED_MODEL, "prompt": text})
+        print(f"[DEBUG] Embedding status: {res.status_code}")
+        if res.status_code == 200:
+            vec = res.json().get("embedding", [])
+            cleaned = sanitize_vector(vec)
+            if cleaned is None:
+                print("[WARN] Invalid embedding vector")
+                return None
+            return cleaned.tolist()
+        else:
+            print(f"[ERROR] Embedding failed: {res.text}")
+    except Exception as e:
+        print(f"[ERROR] Embedding exception: {e}")
+    return None
+
+def get_required_skills(role: str) -> str:
+    prompt = f"List only the top 10 technical skills required for a '{role}' role. Comma-separated, no extra text."
+    try:
+        res = requests.post(OLLAMA_GENAI_URL, json={"model": GENAI_MODEL, "prompt": prompt, "stream": False})
+        if res.status_code == 200:
+            response = res.json().get("response", "").strip()
+            print(f"[DEBUG] GenAI skills: {response}")
+            return ", ".join(response.split(",")[:10])
+    except Exception as e:
+        print(f"[ERROR] GenAI call failed: {e}")
+    return ""
+
+# === Resume Loader ===
+def load_resumes(csv_path="data/resumes.csv"):
+    if not os.path.exists(csv_path):
+        print("[ERROR] Resume file not found.")
         return []
 
-    df = pd.read_csv(csv_file)
+    df = pd.read_csv(csv_path)
     resumes = []
     for _, row in df.iterrows():
-        resumes.append({
-            "name": row["name"],
-            "file": row["file"],
-            "embeddings": {
+        try:
+            embeddings = {
                 "education": json.loads(row["emb_education"]),
                 "experience": json.loads(row["emb_experience"]),
                 "projects": json.loads(row["emb_projects"]),
                 "skills": json.loads(row["emb_skills"]),
                 "other": json.loads(row["emb_other"])
             }
-        })
+            resumes.append({
+                "name": row["name"],
+                "file": row["file"],
+                "embeddings": embeddings
+            })
+        except Exception as e:
+            print(f"[WARN] Skipping resume row: {e}")
     return resumes
 
-# GenAI call to infer required skills
-def get_required_skills_from_genai(role):
-    prompt = f"List the most important skills required by top companies for the role of a '{role}'. Only return a comma-separated list of skills."
-    try:
-        response = requests.post(
-            OLLAMA_GENAI_URL,
-            json={"model": GENAI_MODEL, "prompt": prompt, "stream": False}
-        )
-        if response.status_code == 200:
-            return response.json().get("response", "").strip()
-    except Exception as e:
-        print(f"[ERROR] GenAI call failed: {e}")
-    return ""
-
-# Embedding generator using Ollama
-def get_embedding(text):
-    try:
-        response = requests.post(OLLAMA_URL, json={"model": MODEL, "prompt": text})
-        if response.status_code == 200:
-            return response.json().get("embedding", [])
-    except Exception as e:
-        print(f"[ERROR] Embedding call failed: {e}")
-    return []
-
-# Weighted similarity
+# === Weighted Score ===
 weights = {
-    "genaiskills": 0.225,
     "education": 0.05,
-    "experience": 0.225,
-    "projects": 0.225,
-    "skills": 0.225,
+    "experience": 0.25,
+    "projects": 0.25,
+    "skills": 0.40,
     "other": 0.05
 }
 
-def match_score(job_embedding, resume_embeds, genai_skill_embedding):
+def match_score(job_vec, resume_embeds):
     score = 0
-    score += weights["genaiskills"] * cosine_similarity(genai_skill_embedding, resume_embeds["skills"])
     for section, weight in weights.items():
-        if section == "genaiskills":
-            continue
-        score += weight * cosine_similarity(job_embedding, resume_embeds.get(section, []))
+        score += weight * cosine_similarity(job_vec, resume_embeds.get(section, []))
     return round(score * 100, 2)
 
-class MatchRequest(BaseModel):
-    job_title: str
-    location: str
-
-@app.post("/match_jobs")
+# === Main Matcher Route ===
+@app.post("/")
 def match_jobs(request: MatchRequest):
-    title_query = request.job_title.strip().lower()
-    location_query = request.location.strip().lower()
+    job_title = request.job_title.strip().lower()
+    location = request.location.strip().lower()
+    print(f"[INFO] Matcher triggered with job_title='{job_title}', location='{location}'")
 
-    print("[INFO] Loaded resumes from CSV.")
-    resumes = load_resume_embeddings()
+    resumes = load_resumes()
+    print(f"[INFO] Loaded {len(resumes)} resumes.")
     if not resumes:
-        return
+        return {"matches": []}
 
-    print("[INFO] Inferring required skills using GenAI...")
-    skill_text = get_required_skills_from_genai(title_query)
-    print(f"[INFO] GenAI inferred skills: {skill_text}")
-    genai_skill_embedding = get_embedding(skill_text)
+    skill_text = get_required_skills(job_title)
+    skill_vec = get_embedding(skill_text)
+    if skill_vec is None:
+        print("[ERROR] GenAI skill embedding failed")
+        return {"matches": []}
 
-    print("[INFO] Fetching jobs from MongoDB...")
-    all_jobs = list(collection.find({"embedding": {"$exists": True}}))
-    print(f"[DEBUG] MongoDB contains {len(all_jobs)} job(s) total.")
+    job_query = {
+        "embedding": {"$exists": True},
+        "role": {"$regex": f"^{job_title}$", "$options": "i"},
+        "location_searched": {"$regex": f"^{location}$", "$options": "i"},
+    }
+    jobs = list(collection.find(job_query))
+    print(f"[INFO] Found {len(jobs)} jobs in MongoDB")
 
-    matching_jobs = []
-    for job in all_jobs:
-        title = (job.get("title") or "").lower()
-        location = (job.get("location") or "").lower()
-        if title_query in title and location_query in location:
-            matching_jobs.append(job)
-
-    print(f"[DEBUG] Found {len(matching_jobs)} matching job(s).")
-    if not matching_jobs:
-        print("[WARN] No jobs found for given inputs.")
-        return
-    
     results = []
-    for job in matching_jobs:
-        job_title = job.get("title")
-        company = job.get("company")
-        location = job.get("location")
-        job_embedding = job.get("embedding")
+    for job in jobs:
+        job_vec = sanitize_vector(job.get("embedding", []))
+        if job_vec is None:
+            print(f"[WARN] Skipping job {job.get('title')} - invalid embedding")
+            continue
 
         for resume in resumes:
-            score = match_score(job_embedding, resume["embeddings"], genai_skill_embedding)
-            match_result = {
-                "resume": resume["name"],
-                "job_title": job_title,
-                "company": company,
-                "location": location,
-                "score": score
-            }
-            results.append(match_result)
-            print(f"[MATCH] {resume['name']} → {job_title} at {company} in {location} = {score}%")
+            score = match_score(job_vec, resume["embeddings"])
+            if score > 0:
+                results.append({
+                    "resume": resume["name"],
+                    "job_title": job.get("title", ""),
+                    "company": job.get("company", ""),
+                    "location": job.get("location", ""),
+                    "score": score
+                })
 
+    print(f"[INFO] Total matches found: {len(results)}")
     return {"matches": results}
