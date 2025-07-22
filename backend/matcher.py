@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import requests
 import numpy as np
@@ -7,16 +8,10 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import logging
 
-# FastAPI app
 app = FastAPI()
 
-# Logging setup (like print)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
-
-# Load environment
+# Load environment variables
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
 OLLAMA_URL = "http://localhost:11434/api/embeddings"
@@ -24,40 +19,24 @@ OLLAMA_GENAI_URL = "http://localhost:11434/api/generate"
 MODEL = "nomic-embed-text"
 GENAI_MODEL = "llama3"
 
-# MongoDB
+# MongoDB connection
 client = MongoClient(MONGO_URI)
 db = client["skillelevatr"]
 collection = db["jobs"]
 
-# Resume section weights
-weights = {
-    "genaiskills": 0.225,
-    "education": 0.05,
-    "experience": 0.225,
-    "projects": 0.225,
-    "skills": 0.225,
-    "other": 0.05
-}
-
-class MatchRequest(BaseModel):
-    job_title: str
-    location: str
-
+# Cosine similarity function
 def cosine_similarity(a, b):
-    if not isinstance(a, list) or not isinstance(b, list) or not a or not b:
-        return 0.7
     a, b = np.array(a), np.array(b)
-    if not np.isfinite(a).all() or not np.isfinite(b).all():
+    if not a.any() or not b.any() or np.isnan(a).any() or np.isnan(b).any():
         return 0.7
-    norm_a, norm_b = np.linalg.norm(a), np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.7
-    return float(np.dot(a, b) / (norm_a * norm_b))
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
+# Resume loading from CSV
 def load_resume_embeddings(csv_file="data/resumes.csv"):
     if not os.path.exists(csv_file):
-        log.error("[ERROR] resumes.csv not found.")
+        print("[ERROR] resumes.csv not found.")
         return []
+
     df = pd.read_csv(csv_file)
     resumes = []
     for _, row in df.iterrows():
@@ -69,11 +48,12 @@ def load_resume_embeddings(csv_file="data/resumes.csv"):
                 "experience": json.loads(row["emb_experience"]),
                 "projects": json.loads(row["emb_projects"]),
                 "skills": json.loads(row["emb_skills"]),
-                "other": json.loads(row["emb_other"]),
+                "other": json.loads(row["emb_other"])
             }
         })
     return resumes
 
+# GenAI call to infer required skills
 def get_required_skills_from_genai(role):
     prompt = f"List the most important skills required by top companies for the role of a '{role}'. Only return a comma-separated list of skills."
     try:
@@ -83,49 +63,57 @@ def get_required_skills_from_genai(role):
         )
         if response.status_code == 200:
             return response.json().get("response", "").strip()
-        else:
-            log.error("[ERROR] GenAI response failed.")
-            return ""
     except Exception as e:
-        log.error(f"[ERROR] GenAI call failed: {e}")
-        return ""
+        print(f"[ERROR] GenAI call failed: {e}")
+    return ""
 
+# Embedding generator using Ollama
 def get_embedding(text):
     try:
         response = requests.post(OLLAMA_URL, json={"model": MODEL, "prompt": text})
         if response.status_code == 200:
             return response.json().get("embedding", [])
-        else:
-            log.error("[ERROR] Failed to get embedding.")
-            return []
     except Exception as e:
-        log.error(f"[ERROR] Embedding call failed: {e}")
-        return []
+        print(f"[ERROR] Embedding call failed: {e}")
+    return []
 
-def match_score(job_embedding, resume_embeds, genai_skill_embedding, resume_skill_embedding):
+# Weighted similarity
+weights = {
+    "genaiskills": 0.225,
+    "education": 0.05,
+    "experience": 0.225,
+    "projects": 0.225,
+    "skills": 0.225,
+    "other": 0.05
+}
+
+def match_score(job_embedding, resume_embeds, genai_skill_embedding):
     score = 0
-    score += weights["genaiskills"] * cosine_similarity(genai_skill_embedding, resume_skill_embedding)
+    score += weights["genaiskills"] * cosine_similarity(genai_skill_embedding, resume_embeds["skills"])
     for section, weight in weights.items():
         if section == "genaiskills":
             continue
         score += weight * cosine_similarity(job_embedding, resume_embeds.get(section, []))
     return round(score * 100, 2)
 
+class MatchRequest(BaseModel):
+    job_title: str
+    location: str
+
 @app.post("/match_jobs")
-async def match_jobs(request: MatchRequest):
+def match_jobs(request: MatchRequest):
     title_query = request.job_title.strip().lower()
     location_query = request.location.strip().lower()
 
+    print("[INFO] Loaded resumes from CSV.")
     resumes = load_resume_embeddings()
     if not resumes:
-        raise HTTPException(status_code=400, detail="No resumes found.")
+        return
 
-    print("[INFO] Loaded resumes from CSV.")
-
-    print("[INFO] Generating required skills using GenAI...")
-    genai_skill_list = get_required_skills_from_genai(title_query)
-    print(f"[INFO] GenAI inferred skills: {genai_skill_list}")
-    genai_skill_embedding = get_embedding(genai_skill_list)
+    print("[INFO] Inferring required skills using GenAI...")
+    skill_text = get_required_skills_from_genai(title_query)
+    print(f"[INFO] GenAI inferred skills: {skill_text}")
+    genai_skill_embedding = get_embedding(skill_text)
 
     print("[INFO] Fetching jobs from MongoDB...")
     all_jobs = list(collection.find({"embedding": {"$exists": True}}))
@@ -141,9 +129,9 @@ async def match_jobs(request: MatchRequest):
     print(f"[DEBUG] Found {len(matching_jobs)} matching job(s).")
     if not matching_jobs:
         print("[WARN] No jobs found for given inputs.")
-        return {"matches": []}
-
-    matches = []
+        return
+    
+    results = []
     for job in matching_jobs:
         job_title = job.get("title")
         company = job.get("company")
@@ -151,16 +139,15 @@ async def match_jobs(request: MatchRequest):
         job_embedding = job.get("embedding")
 
         for resume in resumes:
-            resume_skill_embedding = resume["embeddings"].get("skills", [])
-            score = match_score(job_embedding, resume["embeddings"], genai_skill_embedding, resume_skill_embedding)
-            print(f"[MATCH] {resume['name']} → {job_title} at {company} in {location} = {score}%")
-            matches.append({
+            score = match_score(job_embedding, resume["embeddings"], genai_skill_embedding)
+            match_result = {
                 "resume": resume["name"],
-                "job": job_title,
+                "job_title": job_title,
                 "company": company,
                 "location": location,
                 "score": score
-            })
+            }
+            results.append(match_result)
+            print(f"[MATCH] {resume['name']} → {job_title} at {company} in {location} = {score}%")
 
-    matches.sort(key=lambda x: -x["score"])
-    return {"matches": matches}
+    return {"matches": results}
