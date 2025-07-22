@@ -78,16 +78,16 @@ def extract_sections(text):
 # === Save to CSV ===
 def save_to_csv(data_row):
     os.makedirs("data", exist_ok=True)
-    write_header = not os.path.exists(OUTPUT_CSV)
-    with open(OUTPUT_CSV, "a", newline='', encoding="utf-8") as f:
+    with open(OUTPUT_CSV, "w", newline='', encoding="utf-8") as f:
         writer = csv.writer(f)
-        if write_header:
-            writer.writerow([
-                "file", "name", "education", "experience", "projects", "skills", "other",
-                "emb_education", "emb_experience", "emb_projects", "emb_skills", "emb_other"
-            ])
+        # Always write the header
+        writer.writerow([
+            "file", "name", "education", "experience", "projects", "skills", "other",
+            "emb_education", "emb_experience", "emb_projects", "emb_skills", "emb_other"
+        ])
+        # Write only the new resume data
         writer.writerow(data_row)
-    logger.info(f"Resume written to {OUTPUT_CSV}")
+    logger.info(f"Resume CSV cleared and updated with new entry.")
 
 # === Upload Resume Endpoint ===
 @app.post("/upload_resume")
